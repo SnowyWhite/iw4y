@@ -719,6 +719,57 @@ namespace Components
     return result;
   }
 
+  void Renderer::R_Cinematic_FreeMemory(void* memory)
+  {
+    // The cinematic thread decodes the playing video into this memory, which
+    // also holds the Bink handle. R_Cinematic_Shutdown means to stop the
+    // video first, but R_Shutdown marks the renderer as unregistered before
+    // calling it, so it never does and the thread ends up decoding into freed
+    // memory (say, when quitting or restarting the renderer during the
+    // intro). So close the video and drop any pending one while holding the
+    // thread's lock.
+    //
+    Game::Sys_EnterCriticalSection(Game::CRITSECT_CINEMATIC_TARGET_CHANGE_COMMAND);
+
+    Game::R_Cinematic_BinkClose();
+    *Game::cinematicCurrentName = '\0';
+    *Game::cinematicPendingStart = 0;
+    Game::cinematicHunk->base = nullptr;
+    *Game::cinematicMemory = nullptr;
+
+    Game::Z_Free(memory);
+
+    Game::Sys_LeaveCriticalSection(Game::CRITSECT_CINEMATIC_TARGET_CHANGE_COMMAND);
+  }
+
+  Game::dvar_t* Renderer::RegisterDisplayModeDvar(const char* dvarName, const char** valueList, int defaultIndex, unsigned __int16 flags, const char* description)
+  {
+    // The game builds the lists of display modes and refresh rates anew each
+    // time the renderer starts, but registering a dvar that already exists
+    // keeps its old domain and value. So if a list got shorter (say, we are
+    // now on a different monitor), then the value can point past its end and
+    // the dvar reads as null, which crashes whoever uses it (such as the
+    // graphics options menu). So update the domain to the new list and reset
+    // a value that no longer fits it.
+    //
+    auto* dvar = Game::Dvar_RegisterEnum(dvarName, valueList, defaultIndex, flags, description);
+
+    auto count = 0;
+    while (valueList[count])
+      ++count;
+
+    dvar->domain.enumeration.stringCount = count;
+    dvar->domain.enumeration.strings = valueList;
+
+    for (auto* value : {&dvar->current, &dvar->latched, &dvar->reset})
+    {
+      if (value->integer < 0 || value->integer >= count)
+        value->integer = defaultIndex;
+    }
+
+    return dvar;
+  }
+
   Renderer::Renderer()
   {
     if (Dedicated::IsEnabled()) return;
@@ -772,6 +823,13 @@ namespace Components
       Renderer::EndRecoverDeviceSignal();
       Game::DB_EndRecoverLostDevice();
     }, HOOK_CALL).install()->quick();
+
+    // Close the video before freeing its memory in R_Cinematic_Shutdown
+    Utils::Hook(0x51C966, Renderer::R_Cinematic_FreeMemory, HOOK_CALL).install()->quick();
+
+    // Keep the display mode dvars in sync with the modes we enumerated
+    Utils::Hook(0x507162, Renderer::RegisterDisplayModeDvar, HOOK_CALL).install()->quick(); // r_mode
+    Utils::Hook(0x5071EA, Renderer::RegisterDisplayModeDvar, HOOK_CALL).install()->quick(); // r_displayRefresh
 
     // Begin vid_restart
     Utils::Hook(0x4CA2FD, Renderer::PreVidRestart, HOOK_CALL).install()->quick();

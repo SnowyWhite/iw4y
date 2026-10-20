@@ -59,6 +59,11 @@ namespace Components
 
     static bool CheckMapInstalled(const std::string& mapname, bool error = false, bool dlcIsTrue = false);
 
+    // Return the error to show if the map is in a DLC pack we don't have
+    // and nullopt otherwise.
+    //
+    static std::optional<std::string> GetMissingDlcError(const std::string& mapname);
+
     static UserMapContainer* GetUserMap();
     static unsigned int GetUsermapHash(const std::string& map);
 
@@ -124,6 +129,7 @@ namespace Components
 
     static int TriggerReconnectForMap(Game::msg_t* msg, const char* mapname);
     static void RotateCheckStub();
+    static void DownloadsComplete(int localClientNum);
     static void LoadNewMapCommand(char* buffer, size_t size, const char* format, const char* mapname, const char* gametype);
 
     static const char* LoadArenaFileStub(const char* name, char* buffer, int size);

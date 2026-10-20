@@ -20,6 +20,10 @@ wn_dir="$HOME/.wine"
 #
 cfg="Debug"
 
+# Local Sentry configuration file. See sentry.bash.example for details.
+#
+se_file="sentry.bash"
+
 owd="$(pwd)"
 prog="$0"
 
@@ -60,6 +64,13 @@ run ()
   fi
 }
 
+update_submodules ()
+{
+  run git submodule update --init
+  run git submodule foreach --quiet \
+    'test $sm_path = deps/sentry-native || git submodule update --init --recursive'
+}
+
 # Check whether the specified command exists. If the hint is provided, print it
 # alongside the error.
 #
@@ -82,6 +93,10 @@ verb=
 force=
 to=300
 cto=30
+se_dsn=
+se_set=
+no_se=
+se_up=
 
 bcfg=
 
@@ -101,6 +116,10 @@ while test $# -ne 0; do
       diag "  --msvc-dir <dir>    Directory to install the msvc toolchain (~/.msvc by default)."
       diag "  --wine-dir <dir>    Directory to use for the wine prefix (~/.wine by default)."
       diag "  --timeout <sec>     Network operations timeout in seconds (300 by default)."
+      diag "  --sentry-dsn <url>  Submit crash reports to this Sentry DSN."
+      diag "  --sentry-file <f>   Load the Sentry configuration from this file (sentry.bash by default)."
+      diag "  --no-sentry         Compile out crash reporting even if a DSN is configured."
+      diag "  --sentry-upload     Upload debug symbols and sources with sentry-cli after building."
       diag
       diag "By default this script will build the debug configuration."
       diag
@@ -165,6 +184,31 @@ while test $# -ne 0; do
         error "value in seconds expected after --timeout; run $prog -h for details"
       fi
       to="$1"
+      shift
+      ;;
+    --sentry-dsn)
+      shift
+      if test $# -eq 0; then
+        error "url expected after --sentry-dsn; run $prog -h for details"
+      fi
+      se_dsn="$1"
+      shift
+      ;;
+    --sentry-file)
+      shift
+      if test $# -eq 0; then
+        error "file expected after --sentry-file; run $prog -h for details"
+      fi
+      se_file="$1"
+      se_set=true
+      shift
+      ;;
+    --no-sentry)
+      no_se=true
+      shift
+      ;;
+    --sentry-upload)
+      se_up=true
       shift
       ;;
     -*)
@@ -368,6 +412,141 @@ msvc_setup ()
   run cd "$owd"
 }
 
+# Load the local Sentry configuration, if there is one. The file is not
+# tracked by git since it carries the DSN of the project crash reports
+# are submitted to. See sentry.bash.example for the expected contents.
+#
+sentry_setup ()
+{
+  if test "$no_se" = true; then
+    if test "$se_up" = true; then
+      error "--sentry-upload cannot be combined with --no-sentry"
+    fi
+
+    se_dsn=
+    se_txt="disabled (--no-sentry)"
+    return
+  fi
+
+  se_txt="disabled"
+
+  if test -n "$se_dsn"; then
+    se_txt="enabled (--sentry-dsn)"
+    return
+  fi
+
+  if test "$se_set" = true && ! test -f "$se_file"; then
+    error "sentry configuration file '$se_file' does not exist"
+  fi
+
+  if test -f "$se_file"; then
+    diag "info: loading sentry configuration from $se_file"
+
+    # Make sure the file is sourced from the current directory when it
+    # is given as a bare name.
+    #
+    case "$se_file" in
+      /*|./*|../*) sf="$se_file"   ;;
+      *)           sf="./$se_file" ;;
+    esac
+
+    # Export everything the file sets so that sentry-cli and friends can
+    # pick the configuration up from the environment as well.
+    #
+    set -a
+    # shellcheck disable=SC1090
+    . "$sf"
+    set +a
+
+    se_txt="enabled ($se_file)"
+  else
+    se_txt="enabled (environment)"
+  fi
+
+  se_dsn="$SENTRY_DSN"
+
+  if test -z "$se_dsn"; then
+    se_txt="disabled"
+    diag "info: no sentry dsn configured, crash reporting will be compiled out"
+    diag "  info: run 'cp sentry.bash.example $se_file' and fill in the dsn to enable it"
+  fi
+}
+
+# Check that we can upload the debug symbols before we spend time building.
+#
+# Note that this is done after sentry_setup() since the configuration file
+# may set the token.
+#
+sentry_upload_setup ()
+{
+  if test "$se_up" != true; then
+    return
+  fi
+
+  check_cmd sentry-cli "see https://docs.sentry.io/cli/installation/"
+
+  if test -z "${SENTRY_AUTH_TOKEN-}"; then
+    diag "error: no sentry auth token to upload debug symbols with"
+    diag "  info: set SENTRY_AUTH_TOKEN in $se_file or in the environment"
+    fail
+  fi
+}
+
+# Upload the debug symbols of the build, along with the sources they refer to,
+# so that Sentry can symbolicate its reports and show the code around each
+# frame.
+#
+# The PDBs refer to the sources by their path under Wine (Z:\home\...), which
+# sentry-cli can't open since it runs natively. However, a path that doesn't
+# start with / is relative to the current directory and, on Linux, a backslash
+# is just another character in a file name. So we create a directory with an
+# entry named after each such path, linking to the actual file, and run
+# sentry-cli from there.
+#
+upload_symbols ()
+{
+  diag "info: uploading debug symbols to sentry"
+
+  bd="$owd/build/bin/Win32/$cfg"
+  sd="$(mktemp -d)"
+
+  if test -z "$sd"; then
+    error "unable to create temporary directory"
+  fi
+
+  # Map each Z: path (the root of the Linux filesystem under Wine) back to
+  # the file it refers to. We skip what doesn't exist here, such as the
+  # sources of the CRT (which refer to Microsoft's build machines).
+  #
+  # Note that we only look at the PDBs of the modules: the others belong to
+  # static libraries, whose code is in the PDB of the module they are linked
+  # into.
+  #
+  for m in "$bd"/*.dll "$bd"/*.exe; do
+    p="${m%.*}.pdb"
+
+    if test -f "$p"; then
+      sentry-cli debug-files print-sources "$p"
+    fi
+  done | sed -n 's/^  \([Zz]:\\.*\)$/\1/p' | sort -u |
+  while IFS= read -r w; do
+    # shellcheck disable=SC1003
+    f="/$(printf '%s' "$w" | cut -c4- | tr '\\' '/')"
+
+    if test -f "$f" && ! test -e "$sd/$w"; then
+      ln -s "$f" "$sd/$w"
+    fi
+  done
+
+  # shellcheck disable=SC2164
+  run cd "$sd"
+  run sentry-cli debug-files upload --include-sources "$bd"
+
+  # shellcheck disable=SC2164
+  run cd "$owd"
+  run rm -rf "$sd"
+}
+
 gen_info ()
 {
   diag "info: generating build information"
@@ -521,7 +700,15 @@ gen_bbuild ()
   #
   sed '/^[[:space:]]*prebuildcommands/,/^[[:space:]]*}/d; /^[[:space:]]*postbuildcommands/,/^[[:space:]]*}/d' premake5.lua > premake5-linux.lua
 
-  run wine tools/premake5.exe --file=premake5-linux.lua vs2026
+  pargs="--file=premake5-linux.lua"
+  if test -n "$se_dsn"; then
+    pargs="$pargs --sentry-dsn=$se_dsn"
+  fi
+
+  # Deliberate unquoted expansion for premake argument word splitting.
+  #
+  # shellcheck disable=SC2086
+  run wine tools/premake5.exe $pargs vs2026
   run rm -f premake5-linux.lua
 }
 
@@ -555,6 +742,7 @@ build ()
   diag "Build configuration: $cfg"
   diag "Wine prefix:         $wn_dir/"
   diag "MSVC install dir:    $mi_dir/"
+  diag "Crash reporting:     $se_txt"
   diag
   diag "To perform a from-scratch bootstrap, specify the --force option."
   diag
@@ -562,13 +750,17 @@ build ()
 
   if test -n "$submods"; then
     diag "info: updating git submodules"
-    run git submodule update --init --recursive
+    update_submodules
   fi
 
   gen_info
   gen_vscode
   gen_bbuild
   compile
+
+  if test "$se_up" = true; then
+    upload_symbols
+  fi
 
   diag
   diag "-------------------------------------------------------------------------"
@@ -588,6 +780,7 @@ bootstrap ()
   diag "Build configuration: $cfg"
   diag "Wine prefix:         $wn_dir/"
   diag "MSVC install dir:    $mi_dir/"
+  diag "Crash reporting:     $se_txt"
   diag
   if test "$clean" = true; then
   diag "WARNING: --clean option will remove existing wine and msvc installations."
@@ -613,13 +806,17 @@ bootstrap ()
 
   if test -n "$submods"; then
     diag "info: updating git submodules"
-    run git submodule update --init --recursive
+    update_submodules
   fi
 
   gen_info
   gen_vscode
   gen_bbuild
   compile
+
+  if test "$se_up" = true; then
+    upload_symbols
+  fi
 
   diag
   diag "-------------------------------------------------------------------------"
@@ -635,6 +832,9 @@ bootstrap ()
 
 main ()
 {
+  sentry_setup
+  sentry_upload_setup
+
   if check_env; then
     build
   else

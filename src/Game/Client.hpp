@@ -8,6 +8,9 @@ namespace Game
   typedef int(*CL_IsCgameInitialized_t)();
   extern CL_IsCgameInitialized_t CL_IsCgameInitialized;
 
+  typedef void(*CL_InitRenderer_t)();
+  extern CL_InitRenderer_t CL_InitRenderer;
+
   typedef void(*CL_ConnectFromParty_t)(int controllerIndex, _XSESSION_INFO* hostInfo, netadr_t addr, int numPublicSlots, int numPrivateSlots, const char* mapname, const char* gametype);
   extern CL_ConnectFromParty_t CL_ConnectFromParty;
 
@@ -84,6 +87,9 @@ namespace Game
   extern clientStatic_t* cls;
 
   extern clientUIActive_t* clientUIActives;
+
+  extern bool* cl_serverChangingMap;
+  extern char* loadingMapName;
 
   extern clientActive_t* clients;
 

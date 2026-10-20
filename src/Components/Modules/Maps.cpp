@@ -538,7 +538,37 @@ namespace Components
     char hashBuf[100] = { 0 };
     unsigned int hash = atoi(Game::MSG_ReadStringLine(msg, hashBuf, sizeof(hashBuf)));
 
-    if (!Maps::CheckMapInstalled(mapname, false, true) || hash && hash != Maps::GetUsermapHash(mapname))
+    // If the server rotated to a DLC map we don't have, then loading it
+    // fails with a fatal error. So skip the map change, disconnect, and show
+    // the missing DLC error instead, the same as when joining such a server.
+    //
+    // Note that we cannot just fail with Com_Error(): it does disconnect,
+    // but its message is lost on the way back to the main menu. So we show
+    // the error ourselves once cgame is down.
+    //
+    if (const auto message = Maps::GetMissingDlcError(mapname))
+    {
+      Command::Execute("disconnect", false);
+
+      Scheduler::Schedule([message = *message]
+      {
+        if (Game::CL_IsCgameInitialized())
+          return false;
+
+        Game::ShowMessageBox(message, "Error");
+        return true;
+      }, Scheduler::Pipeline::MAIN);
+
+      return true;
+    }
+
+    // If we are still connecting, then the gamestate we have is for the
+    // previous map and loading it on top of the new one fails. So reconnect,
+    // the same as for a map we don't have.
+    //
+    const auto connecting = Game::CL_GetLocalClientConnectionState(0) < Game::CA_ACTIVE;
+
+    if (connecting || !Maps::CheckMapInstalled(mapname, false, true) || hash && hash != Maps::GetUsermapHash(mapname))
     {
       // Reconnecting forces the client to download the new map
       Command::Execute("disconnect", false);
@@ -550,6 +580,26 @@ namespace Components
     }
 
     return false;
+  }
+
+  void Maps::DownloadsComplete(const int localClientNum)
+  {
+    // The game skips loading the map if it already did so ahead of time,
+    // that is, when connecting or when the server announced a map change.
+    // But if the server changed map in the meantime (say, it rotated while
+    // we were connecting), then the gamestate is for a different map than
+    // the one we loaded and starting it fails. So forget about the loaded
+    // map in this case, which makes the game load the right one.
+    //
+    const auto* mapname = Game::Info_ValueForKey(Game::CL_GetConfigString(0), "mapname");
+
+    if (_stricmp(mapname, Game::loadingMapName) != 0)
+    {
+      Game::CL_GetLocalClientUIGlobals(localClientNum)->mapPreloaded = false;
+      *Game::cl_serverChangingMap = false;
+    }
+
+    Game::CL_DownloadsComplete(localClientNum);
   }
 
   __declspec(naked) void Maps::RotateCheckStub()
@@ -725,21 +775,14 @@ namespace Components
   {
     if (FastFiles::Exists(mapname)) return true;
 
-    for (auto& pack : Maps::DlcPacks)
+    if (const auto message = Maps::GetMissingDlcError(mapname))
     {
-      for (auto map : pack.maps)
+      if (error)
       {
-        if (map == mapname)
-        {
-          if (error)
-          {
-            Logger::Error(Game::ERR_DISCONNECT, "Missing DLC pack {} ({}) containing map {} ({}).\nPlease download it to play this map.",
-              pack.name, pack.index, Localization::LocalizeMapName(mapname.data()), mapname);
-          }
-
-          return dlcIsTrue;
-        }
+        Logger::Error(Game::ERR_DISCONNECT, "{}", *message);
       }
+
+      return dlcIsTrue;
     }
 
     if (error)
@@ -749,6 +792,22 @@ namespace Components
     }
 
     return false;
+  }
+
+  std::optional<std::string> Maps::GetMissingDlcError(const std::string& mapname)
+  {
+    if (FastFiles::Exists(mapname)) return {};
+
+    for (const auto& pack : Maps::DlcPacks)
+    {
+      if (std::ranges::find(pack.maps, mapname) != pack.maps.end())
+      {
+        return std::format("Missing DLC pack {} ({}) containing map {} ({}).\nPlease download it to play this map.",
+          pack.name, pack.index, Localization::LocalizeMapName(mapname.data()), mapname);
+      }
+    }
+
+    return {};
   }
 
   void Maps::HideModel()
@@ -974,6 +1033,7 @@ namespace Components
     // Download the map before a map rotation if necessary
     // Conflicts with Theater's SV map rotation check, but this one is safer!
     Utils::Hook(0x5AA91C, Maps::RotateCheckStub, HOOK_CALL).install()->quick();
+    Utils::Hook(0x5AC6E9, Maps::DownloadsComplete, HOOK_CALL).install()->quick(); // CL_ParseGamestate
 
     // Load usermap arena file
     Utils::Hook(0x630A88, Maps::LoadArenaFileStub, HOOK_CALL).install()->quick();
